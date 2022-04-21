@@ -49,7 +49,7 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         self.m_recv_prev = {}
         self.c_recv = {}
         self.c_recv_prev = {}
-        self.c_t = torch.zeros(1, dtype=torch.float32).cuda()
+        self.ones = torch.ones(1, dtype=torch.float32).cuda()
         self.c_temp = torch.zeros(1, dtype=torch.float32).cuda()
         self.n = torch.zeros(1, dtype=torch.float32).cuda()
         self.x_buffered = 0
@@ -157,9 +157,9 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                 bagua.send(x_i_buffered + m_recv_sum, neighbour)
 
                 # send corresponding counters
-                if DEBUG: print('Sending c={} from {} to {}'.format(self.n, rank, neighbour))
-                c_recv_sum = sum_wo((self.c_recv_prev), neighbour)
-                bagua.send(c_recv_sum + self.c_t, neighbour)
+                c_recv_sum = sum_wo((self.c_recv_prev), neighbour) + self.ones
+                if DEBUG: print('Sending c_t={} from {} to {}'.format(c_recv_sum, rank, neighbour))
+                bagua.send(c_recv_sum, neighbour)
 
                 # recieve messages
                 bagua.recv(x_i_buffered, neighbour)
@@ -173,7 +173,7 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             self.m_recv_prev = self.m_recv
             self.c_recv_prev = self.c_recv
             print(sum(self.c_recv.values()))
-            self.n = 1 + sum(self.c_recv)
+            self.n = 1 + sum(self.c_recv.values())
             self.x_buffered = 1. / self.n * (self.x_buffered + sum(self.m_recv.values()))
 
             # TODO unpack x_buffered and overwrite weights.
