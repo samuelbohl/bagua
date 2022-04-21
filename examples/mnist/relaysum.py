@@ -14,7 +14,7 @@ from typing import List
 import torch
 
 USE_RELAY = True
-DEBUG = False
+DEBUG = True
 
 
 class RelayAlgorithmImpl(AlgorithmImpl):
@@ -45,8 +45,10 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         self.communication_interval = communication_interval
         self.cuda_event = torch.cuda.Event()
         self.m = []
-        self.m_recv = []
-        self.c_recv = []
+        self.m_recv = {}
+        self.m_recv_prev = {}
+        self.c_recv = {}
+        self.c_recv_prev = {}
         self.c_t = torch.zeros(1, dtype=torch.float32).cuda()
         self.c_temp = torch.zeros(1, dtype=torch.float32).cuda()
         self.n = torch.zeros(1, dtype=torch.float32).cuda()
@@ -123,6 +125,12 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                     idx = end
 
                 return entries
+            
+            def sum_wo(dict, wo_key):
+                """Sums up values of a given dictionary, excluding the values of wo_key."""
+                if wo_key in dict:
+                    return sum(dict.values()) - dict[wo_key]
+                return sum(dict.values())
 
             # get current rank
             rank = bagua.get_local_rank()
@@ -134,40 +142,39 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                 if nb >= 0 and nb < bagua.get_world_size():
                     neighbours_filtered.append(nb)
 
-            # init m
-            m_recv_sum = sum(self.m_recv)
-            self.m_recv = [] # empty recv buffer for m
-
-            # init c
-            self.c_t = torch.ones(1, dtype=torch.float32).cuda()
-            self.c_t += sum(self.c_recv)
-            self.c_recv = [] # empty recv buffer for c
 
             # init X_i^(t + 1/2)
             x_i = [layer.data for layer in optimizer.param_groups[0]['params']]
             x_i_buffered, shapes = pack(x_i)
+
 
             # iterate over neighbours
             for neighbour in neighbours_filtered:
                 # TODO Deadlock avoidance
 
                 # send messages
+                m_recv_sum = sum_wo((self.m_recv_prev), neighbour)
                 bagua.send(x_i_buffered + m_recv_sum, neighbour)
 
                 # send corresponding counters
-                bagua.send(self.c_t, neighbour)
+                if DEBUG: print('Sending c={} from {} to {}'.format(self.n, rank, neighbour))
+                c_recv_sum = sum_wo((self.c_recv_prev), neighbour)
+                bagua.send(c_recv_sum + self.c_t, neighbour)
 
                 # recieve messages
                 bagua.recv(x_i_buffered, neighbour)
-                self.m_recv.append(x_i_buffered);
+                self.m_recv[neighbour] = x_i_buffered;
 
                 # recieve corresponding counters
                 bagua.recv(self.c_temp, neighbour)
-                self.c_recv.append(self.c_temp);
+                self.c_recv[neighbour] = self.c_temp;
 
-            print(self.n)
+
+            self.m_recv_prev = self.m_recv
+            self.c_recv_prev = self.c_recv
+            print(sum(self.c_recv.values()))
             self.n = 1 + sum(self.c_recv)
-            self.x_buffered = 1. / self.n * (self.x_buffered + sum(self.m_recv))
+            self.x_buffered = 1. / self.n * (self.x_buffered + sum(self.m_recv.values()))
 
             # TODO unpack x_buffered and overwrite weights.
             #x_i_2 = unpack(self.x_buffered , shapes)
