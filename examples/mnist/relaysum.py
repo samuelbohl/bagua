@@ -114,7 +114,6 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                 shapes = [tensor.shape for tensor in tensors]
                 return buffer, shapes
 
-
             def unpack(buffer, shapes):
                 """Provides pointers to tensors of original `shapes` in a flat-packed buffer."""
                 idx = 0
@@ -142,17 +141,12 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                 if nb >= 0 and nb < bagua.get_world_size():
                     neighbours_filtered.append(nb)
 
-
             # init X_i^(t + 1/2)
             x_i = [layer.data for layer in optimizer.param_groups[0]['params']]
             x_i_buffered, shapes = pack(x_i)
             orig = torch.clone(x_i_buffered)
 
-
-            # iterate over neighbours
-            for neighbour in neighbours_filtered:
-                # TODO Deadlock avoidance
-
+            def send_messages(neighbour):
                 # send messages
                 m_recv_sum = sum_wo((self.m_recv_prev), neighbour)
                 bagua.send(x_i_buffered + m_recv_sum, neighbour)
@@ -161,7 +155,8 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                 c_recv_sum = sum_wo((self.c_recv_prev), neighbour) + self.ones
                 if DEBUG: print('Sending c_t={} from {} to {}'.format(c_recv_sum, rank, neighbour))
                 bagua.send(c_recv_sum, neighbour)
-
+            
+            def recv_messages(neighbour):
                 # recieve messages
                 bagua.recv(x_i_buffered, neighbour)
                 self.m_recv[neighbour] = x_i_buffered;
@@ -170,17 +165,30 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                 bagua.recv(self.c_temp, neighbour)
                 self.c_recv[neighbour] = self.c_temp;
 
+            # iterate over neighbours
+            for neighbour in neighbours_filtered:
+                # Deadlock avoidance
+                if neighbour < rank:
+                    send_messages(neighbour)
+                    recv_messages(neighbour)
+                else:
+                    recv_messages(neighbour)
+                    send_messages(neighbour)
 
             self.m_recv_prev = self.m_recv
             self.c_recv_prev = self.c_recv
-            print(sum(self.c_recv.values()))
+            
+            # update n and x_i
             self.n = 1 + sum(self.c_recv.values())
+            if DEBUG: print('rank: {} -> n={}'.format(rank, self.n))
             self.x_buffered = 1. / self.n * (self.x_buffered + sum(self.m_recv.values()))
 
             # TODO unpack x_buffered and overwrite weights.
             #x_i_2 = unpack(self.x_buffered , shapes)
+
+            # report (convergence) behaviour of X_i
             mae = torch.nn.L1Loss()
-            print('rank: {} -> loss: {}'.format(rank, mae(self.x_buffered, orig)))
+            if DEBUG: print('rank: {} -> loss: {}'.format(rank, mae(self.x_buffered, orig)))
 
         return hook
 
