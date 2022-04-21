@@ -133,30 +133,53 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             # iterate over neighbours
             for neighbour in neighbours_filtered:
                 PRINT_COND = DEBUG and rank == 3 or neighbour == 3
-                
-                # send messages: TODO relay gradient messages
-                send_tensor = bucket.flattened_tensor()
-                if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
-                bagua.send(send_tensor, neighbour)
-                if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
 
-                # send precalculated relayed counts
-                if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
-                bagua.send(self.c, neighbour)
-                if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
+                if rank > neighbour:
+                    # send messages: TODO relay gradient messages
+                    send_tensor = bucket.flattened_tensor()
+                    if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
+                    bagua.send(send_tensor, neighbour)
+                    if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
 
-                # recieve messages: TODO aggregate gradient messages
-                recv_tensor_bagua = bucket.flattened_tensor()
-                if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
-                bagua.recv(recv_tensor_bagua, neighbour)
-                if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
+                    # recieve messages: TODO aggregate gradient messages
+                    recv_tensor_bagua = bucket.flattened_tensor()
+                    if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
+                    bagua.recv(recv_tensor_bagua, neighbour)
+                    if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
 
-                # recieve and aggregate counts
-                if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
-                bagua.recv(self.recv_c, neighbour)
-                if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
-                self.recv_c_agg += self.recv_c
+                    # send precalculated relayed counts
+                    if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
+                    bagua.send(self.c, neighbour)
+                    if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
 
+                    # recieve and aggregate counts
+                    if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
+                    bagua.recv(self.recv_c, neighbour)
+                    if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
+                    self.recv_c_agg += self.recv_c
+                else:
+                    # recieve messages: TODO aggregate gradient messages
+                    recv_tensor_bagua = bucket.flattened_tensor()
+                    if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
+                    bagua.recv(recv_tensor_bagua, neighbour)
+                    if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
+
+                    # send messages: TODO relay gradient messages
+                    send_tensor = bucket.flattened_tensor()
+                    if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
+                    bagua.send(send_tensor, neighbour)
+                    if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
+
+                    # recieve and aggregate counts
+                    if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
+                    bagua.recv(self.recv_c, neighbour)
+                    if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
+                    self.recv_c_agg += self.recv_c
+
+                    # send precalculated relayed counts
+                    if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
+                    bagua.send(self.c, neighbour)
+                    if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
             
             # update n
             self.n = 1 + self.recv_c_agg
