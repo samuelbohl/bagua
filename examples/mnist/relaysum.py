@@ -146,6 +146,7 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             # init X_i^(t + 1/2)
             x_i = [layer.data for layer in optimizer.param_groups[0]['params']]
             x_i_buffered, shapes = pack(x_i)
+            orig = torch.clone(x_i_buffered)
 
 
             # iterate over neighbours
@@ -178,6 +179,8 @@ class RelayAlgorithmImpl(AlgorithmImpl):
 
             # TODO unpack x_buffered and overwrite weights.
             #x_i_2 = unpack(self.x_buffered , shapes)
+            mae = torch.nn.L1Loss()
+            print('rank: {} -> loss: {}'.format(rank, mae(self.x_buffered, orig)))
 
         return hook
 
@@ -194,98 +197,6 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         torch.cuda.synchronize()
         bucket.clear_ops()
 
-        def relay_mechanism(*args):
-            # get current rank
-            rank = bagua.get_local_rank()
-            if DEBUG: print('Local Rank: {}'.format(rank))
-
-            # create neighbour list
-            neighbours = [(rank - 1) // 2, 2 * rank + 1, 2 * rank + 2]
-            neighbours_filtered = []
-            for nb in neighbours:
-                if nb >= 0 and nb < bagua.get_world_size():
-                    neighbours_filtered.append(nb)
-
-            # precalc of count
-            self.c = 1 + self.recv_c_agg
-            self.recv_c_agg = torch.zeros(1, dtype=torch.float32).cuda()
-
-            self.X = bucket.flattened_tensor()
-            send_tensor = bucket.flattened_tensor()
-            for mt in self.m:
-                send_tensor += mt
-            self.m = []
-            recv_tensor_bagua = bucket.flattened_tensor()
-
-            self.c_t = torch.zeros(1, dtype=torch.float32).cuda()
-            for c in self.c_buff:
-                self.c_t += c
-            self.c_t += 1
-            self.c_buff = []
-
-            # iterate over neighbours
-            for neighbour in neighbours_filtered:
-                PRINT_COND = DEBUG and (rank == 3 or neighbour == 3)
-
-                if rank > neighbour:
-                    # send messages
-                    if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
-                    bagua.send(send_tensor, neighbour)
-                    if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
-
-                    # recieve messages
-                    if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
-                    bagua.recv(recv_tensor_bagua, neighbour)
-                    self.m.append(recv_tensor_bagua);
-                    if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
-
-                    # send precalculated relayed counts
-                    if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
-                    bagua.send(self.c_t, neighbour)
-                    if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
-
-                    # recieve and aggregate counts
-                    if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
-                    bagua.recv(self.recv_c, neighbour)
-                    if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
-                    self.c_buff.append(self.recv_c);
-                else:
-                    # recieve messages
-                    if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
-                    bagua.recv(recv_tensor_bagua, neighbour)
-                    self.m.append(recv_tensor_bagua);
-                    if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
-
-                    # send messages
-                    if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
-                    bagua.send(send_tensor, neighbour)
-                    if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
-
-                    # recieve and aggregate counts
-                    if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
-                    bagua.recv(self.recv_c, neighbour)
-                    if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
-                    self.c_buff.append(self.recv_c);
-
-                    # send precalculated relayed counts
-                    if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
-                    bagua.send(self.c_t, neighbour)
-                    if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
-            
-            # update n
-            self.n = 1 + sum(self.c_buff);
-            print(self.c_buff)
-            self.n = bagua.get_world_size()
-
-            # TODO update gradient
-            copy_x = self.X
-            self.X = 1 / self.n * (self.X + sum(self.m))
-            #grad = to_bagua_tensor(bucket.flattened_tensor())
-            #grad.bagua_setter_closure(self.X)
-            print('Rank: {} - Abs diff: {}'.format(rank, sum(torch.abs(self.X - copy_x))))
-            print(type(bucket.tensors[0]))
-
-        #bucket.append_python_op(relay_mechanism, group=self.process_group)
         decentralized_op = bucket.append_decentralized_synchronous_op(
             peer_weight=bucket._peer_weight,
             hierarchical=self.hierarchical,
