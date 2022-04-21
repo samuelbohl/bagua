@@ -9,10 +9,12 @@ from bagua.torch_api.algorithms import gradient_allreduce
 import logging
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
 from typing import List
 import torch
 
 USE_RELAY = True
+DEBUG = True
 
 
 class RelayAlgorithmImpl(AlgorithmImpl):
@@ -112,11 +114,10 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         torch.cuda.synchronize()
         bucket.clear_ops()
 
-        comm = bagua.communication._get_default_group().get_global_communicator()
-
         def relay_mechanism(*args):
             # get current rank
             rank = bagua.get_local_rank()
+            if DEBUG: print('Local Rank: {}'.format(rank))
 
             # create neighbour list
             neighbours = [(rank - 1) // 2, 2 * rank + 1, 2 * rank + 2]
@@ -128,21 +129,32 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             # precalc of count
             self.c = 1 + self.recv_c_agg
             self.recv_c_agg = torch.zeros(1, dtype=torch.float32).cuda()
-            
+
+            # iterate over neighbours
             for neighbour in neighbours_filtered:
+                PRINT_COND = DEBUG and rank == 3 or neighbour == 3
+                
                 # send messages: TODO relay gradient messages
                 send_tensor = bucket.flattened_tensor()
-                bagua.send(send_tensor, neighbour, comm=comm)
+                if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
+                bagua.send(send_tensor, neighbour)
+                if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
 
                 # send precalculated relayed counts
-                bagua.send(self.c, neighbour, comm=comm)
+                if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
+                bagua.send(self.c, neighbour)
+                if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
 
                 # recieve messages: TODO aggregate gradient messages
                 recv_tensor_bagua = bucket.flattened_tensor()
-                bagua.recv(recv_tensor_bagua, neighbour, comm=comm)
+                if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
+                bagua.recv(recv_tensor_bagua, neighbour)
+                if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
 
                 # recieve and aggregate counts
-                bagua.recv(self.recv_c, neighbour, comm=comm)
+                if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
+                bagua.recv(self.recv_c, neighbour)
+                if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
                 self.recv_c_agg += self.recv_c
 
             
