@@ -14,7 +14,7 @@ from typing import List
 import torch
 
 USE_RELAY = True
-DEBUG = True
+DEBUG = False
 
 
 class RelayAlgorithmImpl(AlgorithmImpl):
@@ -45,10 +45,12 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         self.communication_interval = communication_interval
         self.cuda_event = torch.cuda.Event()
         self.m = []
-        self.c = torch.zeros(1, dtype=torch.float32).cuda()
-        self.recv_c = torch.zeros(1, dtype=torch.float32).cuda()
-        self.recv_c_agg = torch.zeros(1, dtype=torch.float32).cuda()
+        self.m_recv = []
+        self.c_recv = []
+        self.c_t = torch.zeros(1, dtype=torch.float32).cuda()
+        self.c_temp = torch.zeros(1, dtype=torch.float32).cuda()
         self.n = torch.zeros(1, dtype=torch.float32).cuda()
+        self.x_buffered = 0
 
     def _should_communicate(self, bagua_ddp: BaguaDistributedDataParallel) -> bool:
         cur_step = bagua_ddp.bagua_train_step_counter - 1
@@ -100,6 +102,77 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                     )
 
         return hook
+    
+    def init_post_optimizer_step_hook(self, bagua_ddp: BaguaDistributedDataParallel):
+        def hook(optimizer: torch.optim.Optimizer):
+
+            def pack(tensors):
+                """Packs a list of tensors into one buffer for sending to other workers"""
+                buffer = torch.cat([t.view(-1) for t in tensors])  # copies
+                shapes = [tensor.shape for tensor in tensors]
+                return buffer, shapes
+
+
+            def unpack(buffer, shapes):
+                """Provides pointers to tensors of original `shapes` in a flat-packed buffer."""
+                idx = 0
+                entries = []
+                for tensor_shape in shapes:
+                    end = idx + tensor_shape.numel()
+                    entries.append(buffer[idx:end].view(size=tensor_shape))
+                    idx = end
+
+                return entries
+
+            # get current rank
+            rank = bagua.get_local_rank()
+
+            # create neighbour list
+            neighbours = [(rank - 1) // 2, 2 * rank + 1, 2 * rank + 2]
+            neighbours_filtered = []
+            for nb in neighbours:
+                if nb >= 0 and nb < bagua.get_world_size():
+                    neighbours_filtered.append(nb)
+
+            # init m
+            m_recv_sum = sum(self.m_recv)
+            self.m_recv = [] # empty recv buffer for m
+
+            # init c
+            self.c_t = torch.ones(1, dtype=torch.float32).cuda()
+            self.c_t += sum(self.c_recv)
+            self.c_recv = [] # empty recv buffer for c
+
+            # init X_i^(t + 1/2)
+            x_i = [layer.data for layer in optimizer.param_groups[0]['params']]
+            x_i_buffered, shapes = pack(x_i)
+
+            # iterate over neighbours
+            for neighbour in neighbours_filtered:
+                # TODO Deadlock avoidance
+
+                # send messages
+                bagua.send(x_i_buffered + m_recv_sum, neighbour)
+
+                # send corresponding counters
+                bagua.send(self.c_t, neighbour)
+
+                # recieve messages
+                bagua.recv(x_i_buffered, neighbour)
+                self.m_recv.append(x_i_buffered);
+
+                # recieve corresponding counters
+                bagua.recv(self.c_temp, neighbour)
+                self.c_recv.append(self.c_temp);
+
+            print(self.n)
+            self.n = 1 + sum(self.c_recv)
+            self.x_buffered = 1. / self.n * (self.x_buffered + sum(self.m_recv))
+
+            # TODO unpack x_buffered and overwrite weights.
+            #x_i_2 = unpack(self.x_buffered , shapes)
+
+        return hook
 
     def _init_states(self, bucket: BaguaBucket):
         weight_tensor = bucket.flattened_tensor()
@@ -130,42 +203,53 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             self.c = 1 + self.recv_c_agg
             self.recv_c_agg = torch.zeros(1, dtype=torch.float32).cuda()
 
+            self.X = bucket.flattened_tensor()
+            send_tensor = bucket.flattened_tensor()
+            for mt in self.m:
+                send_tensor += mt
+            self.m = []
+            recv_tensor_bagua = bucket.flattened_tensor()
+
+            self.c_t = torch.zeros(1, dtype=torch.float32).cuda()
+            for c in self.c_buff:
+                self.c_t += c
+            self.c_t += 1
+            self.c_buff = []
+
             # iterate over neighbours
             for neighbour in neighbours_filtered:
-                PRINT_COND = DEBUG and rank == 3 or neighbour == 3
+                PRINT_COND = DEBUG and (rank == 3 or neighbour == 3)
 
                 if rank > neighbour:
-                    # send messages: TODO relay gradient messages
-                    send_tensor = bucket.flattened_tensor()
+                    # send messages
                     if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
                     bagua.send(send_tensor, neighbour)
                     if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
 
-                    # recieve messages: TODO aggregate gradient messages
-                    recv_tensor_bagua = bucket.flattened_tensor()
+                    # recieve messages
                     if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
                     bagua.recv(recv_tensor_bagua, neighbour)
+                    self.m.append(recv_tensor_bagua);
                     if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
 
                     # send precalculated relayed counts
                     if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
-                    bagua.send(self.c, neighbour)
+                    bagua.send(self.c_t, neighbour)
                     if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
 
                     # recieve and aggregate counts
                     if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
                     bagua.recv(self.recv_c, neighbour)
                     if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
-                    self.recv_c_agg += self.recv_c
+                    self.c_buff.append(self.recv_c);
                 else:
-                    # recieve messages: TODO aggregate gradient messages
-                    recv_tensor_bagua = bucket.flattened_tensor()
+                    # recieve messages
                     if PRINT_COND: print('Recieving M from {} to {}'.format(neighbour, rank))
                     bagua.recv(recv_tensor_bagua, neighbour)
+                    self.m.append(recv_tensor_bagua);
                     if PRINT_COND: print('Recieved M from {} to {}'.format(neighbour, rank))
 
-                    # send messages: TODO relay gradient messages
-                    send_tensor = bucket.flattened_tensor()
+                    # send messages
                     if PRINT_COND: print('Sending M from {} to {}'.format(rank, neighbour))
                     bagua.send(send_tensor, neighbour)
                     if PRINT_COND: print('Sent M from {} to {}'.format(rank, neighbour))
@@ -174,23 +258,27 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                     if PRINT_COND: print('Recieving c from {} to {}'.format(neighbour, rank))
                     bagua.recv(self.recv_c, neighbour)
                     if PRINT_COND: print('Recieved c from {} to {}'.format(neighbour, rank))
-                    self.recv_c_agg += self.recv_c
+                    self.c_buff.append(self.recv_c);
 
                     # send precalculated relayed counts
                     if PRINT_COND: print('Sending c from {} to {}'.format(rank, neighbour))
-                    bagua.send(self.c, neighbour)
+                    bagua.send(self.c_t, neighbour)
                     if PRINT_COND: print('Sent c from {} to {}'.format(rank, neighbour))
             
             # update n
-            self.n = 1 + self.recv_c_agg
+            self.n = 1 + sum(self.c_buff);
+            print(self.c_buff)
+            self.n = bagua.get_world_size()
 
             # TODO update gradient
+            copy_x = self.X
+            self.X = 1 / self.n * (self.X + sum(self.m))
+            #grad = to_bagua_tensor(bucket.flattened_tensor())
+            #grad.bagua_setter_closure(self.X)
+            print('Rank: {} - Abs diff: {}'.format(rank, sum(torch.abs(self.X - copy_x))))
+            print(type(bucket.tensors[0]))
 
-            print(bagua.get_local_rank())
-            print(neighbours_filtered)
-            print(bagua.get_world_size())
-
-        bucket.append_python_op(relay_mechanism, group=self.process_group)
+        #bucket.append_python_op(relay_mechanism, group=self.process_group)
         decentralized_op = bucket.append_decentralized_synchronous_op(
             peer_weight=bucket._peer_weight,
             hierarchical=self.hierarchical,
@@ -233,7 +321,7 @@ class RelayAlgorithm(Algorithm):
         )
 
 def main():
-    torch.manual_seed(42)
+    #torch.manual_seed(42)
     torch.cuda.set_device(bagua.get_local_rank())
     bagua.init_process_group()
     logging.getLogger().setLevel(logging.INFO)
@@ -258,13 +346,13 @@ def main():
     X = torch.randn(1000, 200).cuda()
     y = torch.zeros(1000, 1).cuda()
 
-    for epoch in range(1, 101):
+    for epoch in range(1, 10):
         optimizer.zero_grad()
         output = model(X)
         loss = F.mse_loss(output, y)
         loss.backward()
         optimizer.step()
-        logging.info(f"it {epoch}, loss: {loss.item():.6f}")
+        if bagua.get_local_rank() == 0: logging.info(f"it {epoch}, loss: {loss.item():.6f}")
 
 
 if __name__ == "__main__":
