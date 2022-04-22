@@ -144,7 +144,7 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             # init X_i^(t + 1/2)
             x_i = [layer.data for layer in optimizer.param_groups[0]['params']]
             x_i_buffered, shapes = pack(x_i)
-            orig = torch.clone(x_i_buffered)
+            self.x_buffered = torch.clone(x_i_buffered)
 
             def send_messages(neighbour):
                 # send messages
@@ -183,12 +183,14 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             if DEBUG: print('rank: {} -> n={}'.format(rank, self.n))
             self.x_buffered = 1. / self.n * (self.x_buffered + sum(self.m_recv.values()))
 
-            # TODO unpack x_buffered and overwrite weights.
-            #x_i_2 = unpack(self.x_buffered , shapes)
+            # unpack x_buffered
+            x_i_2 = unpack(self.x_buffered , shapes)
+            # overwrite current weights
+            for idx, layer in enumerate(optimizer.param_groups[0]['params']):
+                layer.data = x_i_2[idx]
 
             # report (convergence) behaviour of X_i
-            mae = torch.nn.L1Loss()
-            if DEBUG: print('rank: {} -> loss: {}'.format(rank, mae(self.x_buffered, orig)))
+            if DEBUG: print('rank: {} -> absolute diff after sync: {}'.format(rank, sum(torch.abs(self.x_buffered - orig))))
 
         return hook
 
