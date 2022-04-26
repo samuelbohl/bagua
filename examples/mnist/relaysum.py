@@ -12,9 +12,11 @@ import torch.optim as optim
 import torch.distributed as dist
 from typing import List
 import torch
+import sys
 
 USE_RELAY = True
-DEBUG = True
+OVERWRITE = False
+DEBUG = False
 
 
 class RelayAlgorithmImpl(AlgorithmImpl):
@@ -44,11 +46,8 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         self.peer_selection_mode = peer_selection_mode
         self.communication_interval = communication_interval
         self.cuda_event = torch.cuda.Event()
-        self.m = []
         self.m_recv = {}
-        self.m_recv_prev = {}
         self.c_recv = {}
-        self.c_recv_prev = {}
         self.ones = torch.ones(1, dtype=torch.float32).cuda()
         self.c_temp = torch.zeros(1, dtype=torch.float32).cuda()
         self.n = torch.zeros(1, dtype=torch.float32).cuda()
@@ -79,9 +78,7 @@ class RelayAlgorithmImpl(AlgorithmImpl):
 
     def init_forward_pre_hook(self, bagua_ddp: BaguaDistributedDataParallel):
         def hook(input):
-            if self._should_communicate(bagua_ddp):
-                for tensor in self.tensors:
-                    tensor.bagua_mark_communication_ready()
+            return
 
         return hook
 
@@ -93,15 +90,7 @@ class RelayAlgorithmImpl(AlgorithmImpl):
 
     def init_post_backward_hook(self, bagua_ddp: BaguaDistributedDataParallel):
         def hook():
-            if self._should_communicate(bagua_ddp):
-                bagua_ddp._bagua_backend.wait_pending_comm_ops()
-
-                torch.cuda.current_stream().record_event(self.cuda_event)
-                self.cuda_event.synchronize()
-                for bucket in bagua_ddp.bagua_buckets:
-                    bucket._decentralized_op.copy_back_peer_weight(
-                        bucket.backend_bucket
-                    )
+            return
 
         return hook
     
@@ -127,9 +116,10 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             
             def sum_wo(dict, wo_key):
                 """Sums up values of a given dictionary, excluding the values of wo_key."""
-                if wo_key in dict:
-                    return sum(dict.values()) - dict[wo_key]
-                return sum(dict.values())
+                # if wo_key in dict:
+                #     return sum(dict.values()) - dict[wo_key]
+                # return sum(dict.values())
+                return sum(value for key, value in dict.iteritems() if key != wo_key)
 
             # get current rank
             rank = bagua.get_local_rank()
@@ -144,15 +134,19 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             # init X_i^(t + 1/2)
             x_i = [layer.data for layer in optimizer.param_groups[0]['params']]
             x_i_buffered, shapes = pack(x_i)
+            if DEBUG: orig = torch.clone(x_i_buffered)
             self.x_buffered = torch.clone(x_i_buffered)
 
+            print('Bytes: {}'.format(sys.getsizeof(x_i_buffered.storage())))
+
+            
             def send_messages(neighbour):
                 # send messages
-                m_recv_sum = sum_wo((self.m_recv_prev), neighbour)
+                m_recv_sum = sum_wo(self.m_recv, neighbour)
                 bagua.send(x_i_buffered + m_recv_sum, neighbour)
 
                 # send corresponding counters
-                c_recv_sum = sum_wo((self.c_recv_prev), neighbour) + self.ones
+                c_recv_sum = sum_wo((self.c_recv), neighbour) + self.ones
                 if DEBUG: print('Sending c_t={} from {} to {}'.format(c_recv_sum, rank, neighbour))
                 bagua.send(c_recv_sum, neighbour)
             
@@ -175,9 +169,7 @@ class RelayAlgorithmImpl(AlgorithmImpl):
                     recv_messages(neighbour)
                     send_messages(neighbour)
 
-            self.m_recv_prev = self.m_recv
-            self.c_recv_prev = self.c_recv
-            
+
             # update n and x_i
             self.n = 1 + sum(self.c_recv.values())
             if DEBUG: print('rank: {} -> n={}'.format(rank, self.n))
@@ -185,10 +177,11 @@ class RelayAlgorithmImpl(AlgorithmImpl):
 
             # unpack x_buffered
             x_i_2 = unpack(self.x_buffered , shapes)
+
             # overwrite current weights
             for idx, layer in enumerate(optimizer.param_groups[0]['params']):
                 layer.data = x_i_2[idx]
-
+            
             # report (convergence) behaviour of X_i
             if DEBUG: print('rank: {} -> absolute diff after sync: {}'.format(rank, sum(torch.abs(self.x_buffered - orig))))
 
@@ -206,14 +199,6 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         self._init_states(bucket)
         torch.cuda.synchronize()
         bucket.clear_ops()
-
-        decentralized_op = bucket.append_decentralized_synchronous_op(
-            peer_weight=bucket._peer_weight,
-            hierarchical=self.hierarchical,
-            peer_selection_mode=self.peer_selection_mode,
-            group=self.process_group,
-        )
-        bucket._decentralized_op = decentralized_op
 
 
 class RelayAlgorithm(Algorithm):
@@ -254,7 +239,7 @@ def main():
     bagua.init_process_group()
     logging.getLogger().setLevel(logging.INFO)
 
-    model = torch.nn.Sequential(torch.nn.Linear(200, 1)).cuda()
+    model = torch.nn.Sequential(torch.nn.Linear(100000, 10000),torch.nn.Linear(10000, 1)).cuda()
 
     if USE_RELAY:
         optimizer = optim.SGD(model.parameters(), lr=0.01)
@@ -271,7 +256,7 @@ def main():
     )
 
     model.train()
-    X = torch.randn(1000, 200).cuda()
+    X = torch.randn(1000, 100000).cuda()
     y = torch.zeros(1000, 1).cuda()
 
     for epoch in range(1, 10):
