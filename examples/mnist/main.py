@@ -9,7 +9,6 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 import logging
-import bagua.torch_api as bagua
 
 
 class Net(nn.Module):
@@ -252,9 +251,13 @@ def main():
         algorithm = async_model_average.AsyncModelAverageAlgorithm(
             sync_interval_ms=args.async_sync_interval,
         )
+    elif args.algorithm == "relay":
+        from relay import RelayAlgorithm
+        algorithm = RelayAlgorithm(optimizer=optimizer)
     else:
         raise NotImplementedError
 
+    
     model = model.with_bagua(
         [optimizer],
         algorithm,
