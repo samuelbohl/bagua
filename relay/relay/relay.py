@@ -11,34 +11,27 @@ from torch.optim import Optimizer
 import sys
 
 
-DEBUG = False
-
-
 class RelayAlgorithmImpl(AlgorithmImpl):
     def __init__(
         self,
         process_group: BaguaProcessGroup,
         hierarchical: bool = True,
-        peer_selection_mode: str = "all",
         communication_interval: int = 1,
         optimizer: Optimizer = None,
+        topology: str = "binary_tree"
     ):
         """
-        Implementation of the
-        `Decentralized SGD <https://tutorials.baguasys.com/algorithms/decentralized>`_
-        algorithm.
+        Implementation of the `RelaySGD` algorithm.
 
         Args:
             process_group (BaguaProcessGroup): The process group to work on.
             hierarchical (bool): Enable hierarchical communication.
-            peer_selection_mode (str): Can be ``"all"`` or ``"shift_one"``. ``"all"`` means all workers'
-                weights are averaged in each communication step. ``"shift_one"`` means each worker
-                selects a different peer to do weights average in each communication step.
             communication_interval (int): Number of iterations between two communication steps.
+            optimizer (Optimizer): A torch Optimizer initialized with model parameters.
+            topology (str): Can be ``"binary_tree"`` or ``"chain"``.
         """
         super(RelayAlgorithmImpl, self).__init__(process_group)
         self.hierarchical = hierarchical
-        self.peer_selection_mode = peer_selection_mode
         self.communication_interval = communication_interval
         self.cuda_event = torch.cuda.Event()
         self.m_recv = {}
@@ -55,7 +48,14 @@ class RelayAlgorithmImpl(AlgorithmImpl):
         self.rank = bagua.get_local_rank()
 
         # create neighbour list
-        neighbours = [(self.rank - 1) // 2, 2 * self.rank + 1, 2 * self.rank + 2]
+        neighbours = []
+        if topology == "binary_tree":
+            neighbours = [(self.rank - 1) // 2, 2 * self.rank + 1, 2 * self.rank + 2]
+        elif topology == "chain":
+            neighbours = [self.rank - 1, self.rank + 1]
+        else:
+            raise NotImplementedError
+        
         self.neighbours_filtered = []
         for nb in neighbours:
             if nb >= 0 and nb < bagua.get_world_size():
@@ -109,6 +109,8 @@ class RelayAlgorithmImpl(AlgorithmImpl):
     
     def init_post_optimizer_step_hook(self, bagua_ddp: BaguaDistributedDataParallel):
         def hook(optimizer: torch.optim.Optimizer):
+            if not self._should_communicate(bagua_ddp):
+                return
 
             def pack(tensors):
                 """Packs a list of tensors into one buffer for sending to other workers"""
@@ -134,7 +136,6 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             # init X_i^(t + 1/2)
             x_i = [layer for layer in optimizer.param_groups[0]['params']]
             x_i_buffered, shapes = pack(x_i)
-            if DEBUG: orig = torch.clone(x_i_buffered)
             self.x_buffered = torch.clone(x_i_buffered)
 
             def send_messages(neighbour):
@@ -144,7 +145,6 @@ class RelayAlgorithmImpl(AlgorithmImpl):
 
                 # send corresponding counters
                 self.c_send.copy_(sum_wo((self.c_recv), neighbour) + self.ones)
-                if DEBUG: print('Sending c_t={} from {} to {}'.format(self.c_send, self.rank, neighbour))
                 bagua.send(self.c_send, neighbour)
             
             def recv_messages(neighbour):
@@ -165,7 +165,6 @@ class RelayAlgorithmImpl(AlgorithmImpl):
 
             # update n and x_i
             self.n = 1 + sum(self.c_recv.values())
-            if DEBUG: print('rank: {} -> n={}'.format(self.rank, self.n))
             self.x_buffered.add_(sum(self.m_recv.values())).div_(self.n)
 
             # unpack x_buffered
@@ -174,9 +173,6 @@ class RelayAlgorithmImpl(AlgorithmImpl):
             # overwrite current weights
             for idx, layer in enumerate(optimizer.param_groups[0]['params']):
                 layer.data.copy_(x_i_2[idx])
-            
-            # report (convergence) behaviour of X_i
-            #if DEBUG: print('rank: {} -> absolute diff after sync: {}'.format(self.rank, sum(torch.abs(self.x_buffered - orig))))
 
         return hook
 
@@ -198,31 +194,29 @@ class RelayAlgorithm(Algorithm):
     def __init__(
         self,
         hierarchical: bool = True,
-        peer_selection_mode: str = "all",
         communication_interval: int = 1,
         optimizer: Optimizer = None,
+        topology: str = "binary_tree"
     ):
         """
-        Create an instance of the RelaySum algorithm.
+        Create an instance of the RelaySGD algorithm.
 
         Args:
             hierarchical (bool): Enable hierarchical communication.
-            peer_selection_mode (str): Can be ``"all"`` or ``"shift_one"``. ``"all"`` means all workers'
-                weights are averaged in each communication step. ``"shift_one"`` means each worker
-                selects a different peer to do weights average in each communication step.
             communication_interval (int): Number of iterations between two communication steps.
-
+            optimizer (Optimizer): A torch Optimizer initialized with model parameters.
+            topology (str): Can be ``"binary_tree"`` or ``"chain"``.
         """
         self.hierarchical = hierarchical
-        self.peer_selection_mode = peer_selection_mode
         self.communication_interval = communication_interval
         self.optimizer = optimizer
+        self.topology = topology
 
     def reify(self, process_group: BaguaProcessGroup) -> RelayAlgorithmImpl:
         return RelayAlgorithmImpl(
             process_group,
             hierarchical=self.hierarchical,
-            peer_selection_mode=self.peer_selection_mode,
             communication_interval=self.communication_interval,
-            optimizer=self.optimizer
+            optimizer=self.optimizer,
+            topology=self.topology
         )
